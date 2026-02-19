@@ -3,9 +3,9 @@
 Pad Trainer — finger drumming practice on Maschine Mikro MK3
 =============================================================
 
-Architecture: 2 threads + main thread
-  - Read thread:  HID input → pad/button events → MIDI out (never blocks)
-  - LED thread:   waits for signal → coalesces → single HID write
+Architecture: 3 threads
+  - Read thread:  HID input → pad hits (MIDI + scoring) / button flags
+  - LED thread:   coalesced HID LED writes on signal
   - Main thread:  state machine, metronome tick (~1kHz), countdown, screen
 
 State machine:
@@ -23,17 +23,21 @@ Transitions:
   EX_IDLE        → STOP      → LESSON_SELECT
 
 Controls:
+  PAD MODE / KEYBOARD / CHORDS / STEP — switch bank (Beginner / Intermediate / Pro / Virtuoso)
   PLAY  — start exercise (count-in → play)
   REC   — demo pattern (1 loop preview)
   STOP  — back one level
+  ENCODER push — toggle BPM adjust (in EX_IDLE), turn to change ±1
 
 MIDI:
-  Creates virtual MIDI port "Pad Trainer MIDI" — route it in DAW to drum rack.
+  Creates virtual MIDI port "Pad Trainer MIDI" — route it in DAW.
+  Each bank sends on its own MIDI channel (1-4), metronome on ch 10.
 
 Usage:
     python3 pad_trainer.py                    # Run
     python3 pad_trainer.py --list             # List exercises
     python3 pad_trainer.py --setup            # Configure device order
+    python3 pad_trainer.py --student NAME     # Track progress (stats/name.jsonl)
     python3 pad_trainer.py lesson.json        # Load custom JSON exercise
 
 NOTE: Stop midi_bridge_async.py before running — same HID device.
@@ -45,6 +49,7 @@ import time
 import sys
 import signal
 import threading
+from datetime import datetime
 from pathlib import Path
 
 from maschine import (
@@ -66,6 +71,7 @@ from maschine.constants import (
     COLOR_INDEX_SHIFT,
     BRIGHTNESS_MASK,
 )
+from maschine.screen_font import draw_text_5x7
 
 
 # Optional: MIDI output
@@ -93,13 +99,28 @@ BTN_PLAY     = 22
 BTN_REC      = 23
 BTN_STOP     = 24
 
+BTN_PAD_MODE = 27
+BTN_KEYBOARD = 28
+BTN_CHORDS   = 29
+BTN_STEP     = 30
+
+EXERCISES_PER_BANK = 16
+BANK_BUTTONS = (
+    (BTN_PAD_MODE, 0),   # Beginner
+    (BTN_KEYBOARD, 1),   # Intermediate
+    (BTN_CHORDS,   2),   # Pro
+    (BTN_STEP,     3),   # Virtuoso
+)
+BANK_NAMES = ('Beginner', 'Intermediate', 'Pro', 'Virtuoso')
+
 # Button N → HID report 0x01 byte index and bit mask (pre-computed)
 def _btn_byte_mask(btn_id):
     return 1 + btn_id // 8, 1 << (btn_id % 8)
 
 _BTN_MAP = {
     btn: _btn_byte_mask(btn)
-    for btn in (BTN_PLAY, BTN_REC, BTN_STOP)
+    for btn in (BTN_PLAY, BTN_REC, BTN_STOP,
+                BTN_PAD_MODE, BTN_KEYBOARD, BTN_CHORDS, BTN_STEP)
 }
 
 
@@ -156,10 +177,10 @@ def _led_byte(color_idx, brightness):
 
 # Distinct colors for lesson select pads (one per exercise)
 LESSON_COLORS = [
-    Color.FUCHSIA, Color.YELLOW, Color.LIGHT_ORANGE, Color.ORANGE,
-    Color.CYAN, Color.BLUE, Color.VIOLET, Color.MAGENTA,
-    Color.LIME, Color.MINT, Color.TURQUOISE, Color.PLUM,
-    Color.WARM_YELLOW, Color.PURPLE, Color.LIGHT_ORANGE, Color.FUCHSIA,
+    Color.CYAN, Color.PURPLE, Color.MAGENTA, Color.BLUE,
+    Color.VIOLET, Color.TURQUOISE, Color.PLUM, Color.MINT,
+    Color.CYAN, Color.PURPLE, Color.MAGENTA, Color.BLUE,
+    Color.VIOLET, Color.TURQUOISE, Color.PLUM, Color.MINT,
 ]
 
 
@@ -170,10 +191,8 @@ LESSON_COLORS = [
 MIDI_PORT_NAME = "Pad Trainer MIDI"
 MIDI_BASE_NOTE = 36  # C1 — fallback if layer has no midi_note
 
-# MIDI status bytes
-MIDI_NOTE_ON      = 0x90  # channel 1
-MIDI_NOTE_OFF     = 0x80
-MIDI_NOTE_ON_CH10 = 0x99  # channel 10 (drums)
+# MIDI status bytes (channel 10 = drums, metronome)
+MIDI_NOTE_ON_CH10  = 0x99
 MIDI_NOTE_OFF_CH10 = 0x89
 
 # Metronome click on downbeats (every 4 steps), channel 10
@@ -369,18 +388,17 @@ class HitTracker:
 
     def grade_loop(self, layer_idx, slot, ok_ms, window_ms,
                    expected_hits=0):
-        """Grade a loop: 'green', 'yellow', 'red', or None.
-
-        green:  all notes hit, no extras, max |offset| < ok_ms
-        yellow: all notes hit, max |offset| < window_ms (extras → yellow)
-        red:    missed notes or offset >= window_ms
-        """
         slots = self._loops.get(layer_idx)
         if not slots or slot < 0 or slot >= self.num_loops:
             return None, "no_data"
         loop_data = slots[slot]
+        extras = self._extras.get(layer_idx, [0] * self.num_loops)[slot]
+
         if not loop_data:
+            if expected_hits == 0:
+                return 'green', "silent"
             return 'red', "0_hits"
+
         hits = len(loop_data)
         missing = max(0, expected_hits - hits) if expected_hits > 0 else 0
 
@@ -392,15 +410,114 @@ class HitTracker:
         if max_off >= window_ms:
             return 'red', f"max_off={max_off:.0f}ms>={window_ms}"
 
-        extras = self._extras.get(layer_idx, [0] * self.num_loops)[slot]
-
         if missing == 1:
             steps_hit = sorted(loop_data.keys())
             return 'yellow', f"{hits}/{expected_hits} steps={steps_hit} max={max_off:.0f}ms ex={extras}"
 
-        if max_off < ok_ms and extras == 0:
+        if max_off < ok_ms and extras <= 1:
             return 'green', f"{hits}h {max_off:.0f}ms"
         return 'yellow', f"{hits}h {max_off:.0f}ms ex={extras}"
+
+
+# =============================================================================
+# Stats Writer — JSONL per-student progress tracking
+# =============================================================================
+
+STATS_DIR = Path(__file__).parent / "stats"
+
+
+class StatsWriter:
+    """Appends one JSONL line per completed 8-loop pass."""
+
+    def __init__(self, student_name):
+        import re
+        self.student = student_name
+        self.slug = re.sub(r'[^\w-]', '_', student_name).lower().strip('_')
+        STATS_DIR.mkdir(exist_ok=True)
+        self.path = STATS_DIR / f"{self.slug}.jsonl"
+        self.session = self._next_session()
+        self.session_start = datetime.now().isoformat(timespec='seconds')
+        self._last_result = self._load_last_results()
+
+    def _next_session(self):
+        if not self.path.exists():
+            return 1
+        max_s = 0
+        for line in self.path.open():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                max_s = max(max_s, json.loads(line).get('session', 0))
+            except json.JSONDecodeError:
+                pass
+        return max_s + 1
+
+    def write_pass(self, *, exercise_name, exercise_idx, bpm, bpm_after,
+                   subdivisions, duration_s, loop_grades, loop_layers):
+        greens = sum(1 for g in loop_grades if g == 'green')
+        yellows = sum(1 for g in loop_grades if g == 'yellow')
+        reds = sum(1 for g in loop_grades if g == 'red')
+
+        record = {
+            'student': self.slug,
+            'session': self.session,
+            'session_start': self.session_start,
+            'ts': datetime.now().isoformat(timespec='seconds'),
+            'exercise': exercise_name,
+            'exercise_idx': exercise_idx,
+            'bpm': bpm,
+            'bpm_after': bpm_after,
+            'subdivisions': subdivisions,
+            'duration_s': round(duration_s, 1),
+            'loops': [
+                {
+                    'grade': loop_grades[i],
+                    'layers': loop_layers[i],
+                }
+                for i in range(len(loop_grades))
+                if loop_grades[i] is not None
+            ],
+            'summary': {'greens': greens, 'yellows': yellows, 'reds': reds},
+        }
+        with self.path.open('a') as f:
+            f.write(json.dumps(record, ensure_ascii=False) + '\n')
+
+        self._last_result[exercise_idx] = (greens, yellows, reds)
+
+    def last_results(self):
+        """Return dict: exercise_idx → 'green'/'yellow'/'red' based on last pass."""
+        return {idx: self._classify(*counts)
+                for idx, counts in self._last_result.items()}
+
+    def _load_last_results(self):
+        results = {}
+        if not self.path.exists():
+            return results
+        for line in self.path.open():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+                idx = rec.get('exercise_idx')
+                s = rec.get('summary', {})
+                if idx is not None:
+                    results[idx] = (s.get('greens', 0), s.get('yellows', 0), s.get('reds', 0))
+            except json.JSONDecodeError:
+                pass
+        return results
+
+    @staticmethod
+    def _classify(greens, yellows, reds):
+        total = greens + yellows + reds
+        if total == 0:
+            return 'red'
+        if greens >= total * 0.75:
+            return 'green'
+        if reds > total * 0.5:
+            return 'red'
+        return 'yellow'
 
 
 # =============================================================================
@@ -527,42 +644,36 @@ class ScreenRenderer:
 class Trainer:
     """Runs exercises on one Maschine Mikro MK3.
 
-    2 threads + main:
-      Read thread  — HID → pad/button events → MIDI (never blocks)
-      LED thread   — waits for signal → coalesces → single HID write
+    3 threads:
+      Read thread  — HID input → pad hits (MIDI + scoring) / button flags
+      LED thread   — coalesced HID LED writes on signal
       Main thread  — state machine, clock tick (~1kHz), countdown, screen
-
-    States: LESSON_SELECT → EX_IDLE → EX_DEMO / EX_COUNTDOWN → EX_PLAYING
-
-    Read thread ONLY sets flags (_action_*). Main thread acts on them.
     """
 
     HIT_WINDOW_MS = 120.0
     NOTE_DURATION_STEPS = 3
     COUNTDOWN_BEATS = 4
 
-    def __init__(self, device, exercises, debug=False):
+    def __init__(self, device, exercises, debug=False, stats=None):
         self.device = device
         self.exercises = exercises
         self.debug = debug
+        self.stats = stats
         self.rend = Renderer(device)
         self.scr = ScreenRenderer(logo_path=LOGO_PATH)
         self.tracker = HitTracker()
 
-        # MIDI output
         self.midi_out = rtmidi.MidiOut()
         self.midi_out.open_virtual_port(MIDI_PORT_NAME)
 
         self._pending_offs = []
 
-        # Button dispatch table (built once)
         self._BTN_ACTIONS = (
             (BTN_PLAY, self._on_play),
             (BTN_STOP, self._on_stop_btn),
             (BTN_REC,  self._on_rec),
         )
 
-        # Exercise state
         self.exercise = None
         self.clock = None
 
@@ -574,29 +685,33 @@ class Trainer:
         self._btn = {}
         self._pad_layer = {}
 
-        # Hit feedback protection: pad_idx → perf_counter expiry
-        self._hit_protect = {}
-
-        # User-pressed notes: pad_idx → midi note (for note-off on release)
-        self._pressed_notes = {}
-
-        # Lesson select: pad_idx → exercise index
-        self._lesson_pad_map = {}
-
-        # Absolute clock loop where the current 8-loop pass started
+        self._hit_protect = {}     # pad_idx → perf_counter expiry
+        self._pressed_notes = {}   # pad_idx → midi note
+        self._lesson_pad_map = {}  # pad_idx → exercise index
         self._pass_base = 0
+        self._pass_start_time = 0.0
+        self._exercise_idx = 0
 
-        # Loop meter: grades for the current 8-loop pass
         self._loop_grades = [None] * LOOPS_TO_PASS
         self._loop_pass_idx = 0
 
-        # Action flags — set by read thread, consumed by main thread
+        self._current_bank = 0
+        self._midi_channel = 0
+        self._note_on_cmd = 0x90
+        self._note_off_cmd = 0x80
+
         self._action_play = False
         self._action_stop = False
         self._action_rec = False
         self._action_select_exercise = -1
+        self._action_bank_switch = -1
 
-        # Performance counters (debug mode)
+        self._enc_last_pos = None
+        self._enc_pressed = False
+        self._bpm_adjust_mode = False
+        self._action_encoder_delta = 0
+        self._action_encoder_push = False
+
         self._perf_hid_reads = 0
         self._perf_pad_events = 0
         self._perf_midi_sends = 0
@@ -604,16 +719,13 @@ class Trainer:
         self._perf_tick_count = 0
         self._perf_last_print = time.perf_counter()
 
-        # Threading
         self.running = True
-
-        # LED thread
         self._led_dirty = False
         self._led_event = threading.Event()
+        self._wake_event = threading.Event()
         self._led_thread = threading.Thread(target=self._led_loop, daemon=True)
         self._led_thread.start()
 
-        # Read thread (HID input only — lightweight, never blocks)
         self._read_thread = threading.Thread(target=self._read_loop, daemon=True)
         self._read_thread.start()
 
@@ -627,21 +739,21 @@ class Trainer:
             self._led_event.clear()
             if self._led_dirty:
                 self._led_dirty = False
-                try:
-                    self.device.device.write(self.device.led_buffer)
-                    self._perf_led_writes += 1
-                except Exception:
-                    pass
+                self.device.device.write(self.device.led_buffer)
+                self._perf_led_writes += 1
 
     def _signal_led(self):
         self._led_dirty = True
         self._led_event.set()
 
+    def _signal_wake(self):
+        self._wake_event.set()
+
     def _midi_send(self, msg):
         self.midi_out.send_message(msg)
 
     # =====================================================================
-    # Read thread — HID only, no blocking, no state changes
+    # Read thread — HID input, pad scoring, MIDI sends
     # =====================================================================
 
     VEL_THRESHOLD = 5
@@ -649,7 +761,6 @@ class Trainer:
 
     def _read_loop(self):
         hid_dev = self.device.device
-        _PRESS_ON = PadEventType.PRESS_ON
         _NOTE_ON = PadEventType.NOTE_ON
         _PRESS_OFF = PadEventType.PRESS_OFF
         _NOTE_OFF = PadEventType.NOTE_OFF
@@ -658,11 +769,7 @@ class Trainer:
         _vel_thr = self.VEL_THRESHOLD
 
         while self.running:
-            try:
-                data = hid_dev.read(64, timeout_ms=10)
-            except Exception:
-                time.sleep(0.001)
-                continue
+            data = hid_dev.read(64, timeout_ms=10)
 
             if not data:
                 continue
@@ -692,7 +799,7 @@ class Trainer:
 
                     etype = event_byte & 0xf0
 
-                    if etype == _PRESS_ON or etype == _NOTE_ON:
+                    if etype == _NOTE_ON:
                         vel12 = ((event_byte & 0x0f) << 8) | vel_low
                         vel = min(127, vel12 >> 5)
                         if vel < _vel_thr:
@@ -733,7 +840,8 @@ class Trainer:
                     self._perf_tick_count += 1
                     time.sleep(0.001)
                 else:
-                    time.sleep(0.01)
+                    self._wake_event.wait(timeout=0.1)
+                    self._wake_event.clear()
 
                 # Debug: print perf stats every 3 seconds
                 if self.debug:
@@ -762,6 +870,15 @@ class Trainer:
 
     def _process_actions(self):
         """Consume action flags set by the read thread."""
+        # Bank switch (only in LESSON_SELECT)
+        bank = self._action_bank_switch
+        if bank >= 0:
+            self._action_bank_switch = -1
+            if self.state == 'LESSON_SELECT' and bank != self._current_bank:
+                self._set_bank(bank)
+                self._enter_lesson_select()
+            return
+
         # Exercise selection (from LESSON_SELECT pad press)
         ex_idx = self._action_select_exercise
         if ex_idx >= 0:
@@ -772,6 +889,7 @@ class Trainer:
 
         if self._action_stop:
             self._action_stop = False
+            self._bpm_adjust_mode = False
             if self.state == 'EX_IDLE':
                 self._enter_lesson_select()
             elif self.state in ('EX_DEMO', 'EX_COUNTDOWN', 'EX_PLAYING'):
@@ -781,12 +899,35 @@ class Trainer:
         if self._action_rec:
             self._action_rec = False
             if self.state == 'EX_IDLE':
+                self._bpm_adjust_mode = False
                 self._enter_demo()
             return
+
+        # Encoder push: toggle BPM adjust mode in EX_IDLE
+        if self._action_encoder_push:
+            self._action_encoder_push = False
+            if self.state == 'EX_IDLE':
+                self._bpm_adjust_mode = not self._bpm_adjust_mode
+                if self._bpm_adjust_mode:
+                    self._render_bpm_screen()
+                else:
+                    self.scr.render_pattern(self.exercise)
+                    self.scr.write(self.device)
+
+        # Encoder turn: adjust BPM if in adjust mode
+        delta = self._action_encoder_delta
+        if delta != 0:
+            self._action_encoder_delta = 0
+            if self.state == 'EX_IDLE' and self._bpm_adjust_mode:
+                self._current_bpm = max(self.BPM_MIN,
+                                        min(self.BPM_MAX, self._current_bpm + delta))
+                self.clock.set_bpm(self._current_bpm)
+                self._render_bpm_screen()
 
         if self._action_play:
             self._action_play = False
             if self.state == 'EX_IDLE':
+                self._bpm_adjust_mode = False
                 self._enter_countdown()
             elif self.state == 'EX_DEMO':
                 if self.clock:
@@ -795,14 +936,13 @@ class Trainer:
                 self._enter_countdown()
             return
 
-    START_BPM = 90
     BPM_STEP = 5
-    BPM_MIN = 50
+    BPM_MIN = 40
     BPM_MAX = 200
 
     def _load_exercise(self, ex_idx):
         self.exercise = self.exercises[ex_idx]
-        self._current_bpm = self.START_BPM
+        self._current_bpm = self.exercise.bpm
         self.clock = ClockEngine(self._current_bpm, self.exercise.steps,
                                  self.exercise.subdivisions)
         self._pad_layer = {}
@@ -810,6 +950,22 @@ class Trainer:
             self._pad_layer[layer.pad_idx] = i
         self._hit_protect = {}
         self._pressed_notes = {}
+
+    # =====================================================================
+    # Bank switching
+    # =====================================================================
+
+    def _set_bank(self, bank_idx):
+        self._current_bank = bank_idx
+        self._midi_channel = bank_idx
+        self._note_on_cmd = 0x90 + bank_idx
+        self._note_off_cmd = 0x80 + bank_idx
+
+    def _update_bank_leds(self):
+        for btn_id, _ in BANK_BUTTONS:
+            self.rend.button_led_off(btn_id)
+        active_btn = BANK_BUTTONS[self._current_bank][0]
+        self.rend.button_led(active_btn, Color.WHITE, BRIGHTNESS_BRIGHT)
 
     # =====================================================================
     # State: LESSON_SELECT — pick exercise by pressing a pad
@@ -826,35 +982,50 @@ class Trainer:
         self.rend.clear_pads()
         self.rend.strip_clear()
 
-        # Map exercises to pads 1..N (all 16)
+        bank = self._current_bank
+        base = bank * EXERCISES_PER_BANK
+        progress = self.stats.last_results() if self.stats else {}
+        _GRADE_COLOR = {'green': Color.GREEN, 'yellow': Color.YELLOW, 'red': Color.RED}
+
         self._lesson_pad_map = {}
-        for i, ex in enumerate(self.exercises):
-            if i >= 16:
+        for slot in range(EXERCISES_PER_BANK):
+            ex_idx = base + slot
+            if ex_idx >= len(self.exercises):
                 break
-            pidx = user_to_idx(i + 1)
-            color = LESSON_COLORS[i % len(LESSON_COLORS)]
-            self.rend.pad(pidx, color, BRIGHTNESS_BRIGHT)
-            self._lesson_pad_map[pidx] = i
+            pidx = user_to_idx(slot + 1)
+            grade = progress.get(ex_idx)
+            if grade:
+                color = _GRADE_COLOR.get(grade, Color.WHITE)
+                brightness = BRIGHTNESS_BRIGHT
+            else:
+                color = Color.WHITE
+                brightness = BRIGHTNESS_DIM
+            self.rend.pad(pidx, color, brightness)
+            self._lesson_pad_map[pidx] = ex_idx
 
         self.rend.button_led_off(BTN_PLAY)
         self.rend.button_led_off(BTN_STOP)
         self.rend.button_led_off(BTN_REC)
+        self._update_bank_leds()
         self._signal_led()
 
-        # Screen — logo
         self.scr.render_logo()
         self.scr.write(self.device)
 
-        # Console
+        _GRADE_EMOJI = {'green': '🟢', 'yellow': '🟡', 'red': '🔴'}
+        bank_name = BANK_NAMES[bank] if bank < len(BANK_NAMES) else f"Bank {bank}"
         print(f"\n{'=' * 56}")
-        print("  Выбор урока — нажми пад")
+        print(f"  {bank_name}  (MIDI ch {self._midi_channel + 1})")
         print(f"{'=' * 56}")
-        for i, ex in enumerate(self.exercises):
-            if i >= 16:
+        for slot in range(EXERCISES_PER_BANK):
+            ex_idx = base + slot
+            if ex_idx >= len(self.exercises):
                 break
-            emoji = _COLOR_EMOJI.get(LESSON_COLORS[i % len(LESSON_COLORS)], '⬜')
+            ex = self.exercises[ex_idx]
+            grade = progress.get(ex_idx)
+            emoji = _GRADE_EMOJI.get(grade, '⬜')
             subs_label = f" [{ex.subdivisions}/beat]" if ex.subdivisions != 4 else ""
-            print(f"  пад {i + 1:2d} = {emoji} {ex.name}{subs_label}")
+            print(f"  pad {slot + 1:2d} = {emoji} {ex.name}{subs_label}")
         print()
 
     # =====================================================================
@@ -865,6 +1036,7 @@ class Trainer:
         self.state = 'EX_IDLE'
 
         if ex_idx is not None:
+            self._exercise_idx = ex_idx
             self._load_exercise(ex_idx)
 
         if self.clock:
@@ -907,6 +1079,14 @@ class Trainer:
         print("  PLAY → начать упражнение (с отсчётом)")
         print("  STOP → назад к выбору урока")
         print()
+
+    def _render_bpm_screen(self):
+        """Show BPM value on screen (encoder adjust mode)."""
+        scr = self.scr.screen
+        scr.clear()
+        draw_text_5x7(scr, 4, 2, "BPM", scale=1)
+        draw_text_5x7(scr, 30, 4, str(self._current_bpm), scale=3)
+        self.scr.write(self.device)
 
     # =====================================================================
     # State: EX_DEMO — pattern plays 1 loop, then back to EX_IDLE
@@ -952,8 +1132,8 @@ class Trainer:
                 print(" отмена")
                 return None
 
-            for layer in layers:
-                self.rend.pad(layer.pad_idx, Color.WHITE, BRIGHTNESS_BRIGHT)
+            for i in range(16):
+                self.rend.pad(i, Color.WHITE, BRIGHTNESS_BRIGHT)
             self.rend.strip_playhead(beat / self.COUNTDOWN_BEATS)
             self._signal_led()
 
@@ -963,6 +1143,7 @@ class Trainer:
 
             time.sleep(beat_dur * 0.15)
 
+            self.rend.clear_pads()
             for layer in layers:
                 self.rend.pad(layer.pad_idx, layer.color, BRIGHTNESS_BRIGHT)
             self._signal_led()
@@ -983,6 +1164,7 @@ class Trainer:
 
         self.tracker.init_pass(len(self.exercise.layers))
         self._pass_base = 0
+        self._pass_start_time = time.perf_counter()
         self._last_step = -1
         self._last_loop = -1
         self._pending_offs.clear()
@@ -1165,12 +1347,49 @@ class Trainer:
         else:
             print(f"\n  ➡ Продолжаем BPM {self._current_bpm}  🟢{greens} 🟡{yellows} 🔴{reds}\n")
 
+        if self.stats:
+            duration_s = time.perf_counter() - self._pass_start_time
+            ex = self.exercise
+            loop_layers = []
+            for slot in range(LOOPS_TO_PASS):
+                layers_info = []
+                for li, layer in enumerate(ex.layers):
+                    loop_data = self.tracker._loops.get(li, [{}] * LOOPS_TO_PASS)[slot]
+                    extras = self.tracker._extras.get(li, [0] * LOOPS_TO_PASS)[slot]
+                    hits = len(loop_data)
+                    max_off = max((abs(o) for o, _ in loop_data.values()), default=0.0)
+                    lg, _ = self.tracker.grade_loop(
+                        li, slot, ex.timing_ok_ms, self.HIT_WINDOW_MS,
+                        expected_hits=layer.hits_per_loop)
+                    layers_info.append({
+                        'name': layer.name,
+                        'grade': lg,
+                        'hits': hits,
+                        'expected': layer.hits_per_loop,
+                        'extras': extras,
+                        'max_off': round(max_off, 1),
+                    })
+                loop_layers.append(layers_info)
+
+            ex_name = ex.name
+            self.stats.write_pass(
+                exercise_name=ex_name,
+                exercise_idx=self._exercise_idx,
+                bpm=old_bpm,
+                bpm_after=self._current_bpm,
+                subdivisions=ex.subdivisions,
+                duration_s=duration_s,
+                loop_grades=self._loop_grades,
+                loop_layers=loop_layers,
+            )
+
         self._loop_grades = [None] * LOOPS_TO_PASS
         self._loop_pass_idx = 0
         self._clear_loop_meter()
 
         self.tracker.init_pass(len(self.exercise.layers))
         self._pass_base = self.clock.current_loop if self.clock and self.clock.running else 0
+        self._pass_start_time = time.perf_counter()
 
         if bpm_changed:
             self.state = 'EX_COUNTDOWN'
@@ -1236,12 +1455,12 @@ class Trainer:
             if layer.hit_at(step):
                 self.rend.pad(pidx, Color.WHITE, BRIGHTNESS_BRIGHT)
                 note = layer.midi_note
-                midi_batch.append([MIDI_NOTE_ON, note, layer.vel_at(step)])
+                midi_batch.append([self._note_on_cmd, note, layer.vel_at(step)])
                 off_step = (step + self.NOTE_DURATION_STEPS) % self.exercise.steps
                 off_loop = self.clock.current_loop
                 if off_step <= step:
                     off_loop += 1
-                self._pending_offs.append((off_loop, off_step, note, MIDI_NOTE_OFF))
+                self._pending_offs.append((off_loop, off_step, note, self._note_off_cmd))
             else:
                 self.rend.pad(pidx, layer.color, BRIGHTNESS_BRIGHT)
 
@@ -1294,7 +1513,7 @@ class Trainer:
             send([status, note, 0])
         self._pending_offs.clear()
         for note in self._pressed_notes.values():
-            send([MIDI_NOTE_OFF, note, 0])
+            send([self._note_off_cmd, note, 0])
         self._pressed_notes.clear()
 
     # =====================================================================
@@ -1310,14 +1529,53 @@ class Trainer:
                 action()
             self._btn[btn_id] = pressed
 
+        for btn_id, bank_idx in BANK_BUTTONS:
+            byte_idx, mask = _BTN_MAP[btn_id]
+            pressed = (data[byte_idx] & mask) != 0
+            was = self._btn.get(btn_id, False)
+            if pressed and not was:
+                self._action_bank_switch = bank_idx
+                self._signal_wake()
+            self._btn[btn_id] = pressed
+
+        if len(data) >= 8:
+            self._process_encoder(data)
+
+    def _process_encoder(self, data):
+        enc_press = data[5] == 0x80
+        enc_touch = data[6] == 0x01
+        enc_pos = data[7]
+
+        if enc_press and not self._enc_pressed:
+            self._action_encoder_push = True
+            self._signal_wake()
+        self._enc_pressed = enc_press
+
+        if enc_touch:
+            if self._enc_last_pos is not None and enc_pos != self._enc_last_pos:
+                delta = enc_pos - self._enc_last_pos
+                if delta > 8:
+                    delta -= 16
+                elif delta < -8:
+                    delta += 16
+                if delta != 0:
+                    self._action_encoder_delta += delta
+                    self._signal_wake()
+            self._enc_last_pos = enc_pos
+        else:
+            self._enc_last_pos = None
+
     def _on_play(self):
         self._action_play = True
+        self._signal_wake()
 
     def _on_stop_btn(self):
         self._action_stop = True
+        self._signal_wake()
 
     def _on_rec(self):
         self._action_rec = True
+        self._signal_wake()
 
     # =====================================================================
     # Pad events (from read thread)
@@ -1329,6 +1587,7 @@ class Trainer:
             ex_idx = self._lesson_pad_map.get(pad_idx)
             if ex_idx is not None:
                 self._action_select_exercise = ex_idx
+                self._signal_wake()
             return
 
         layer_idx = self._pad_layer.get(pad_idx)
@@ -1338,8 +1597,7 @@ class Trainer:
         layer = self.exercise.layers[layer_idx]
         note = layer.midi_note
 
-        # Send MIDI note-on; track for release-based note-off
-        self._midi_send([MIDI_NOTE_ON, note, velocity])
+        self._midi_send([self._note_on_cmd, note, velocity])
         self._perf_midi_sends += 1
         self._pressed_notes[pad_idx] = note
 
@@ -1403,7 +1661,7 @@ class Trainer:
     def _on_pad_release(self, pad_idx):
         note = self._pressed_notes.pop(pad_idx, None)
         if note is not None:
-            self._midi_send([MIDI_NOTE_OFF, note, 0])
+            self._midi_send([self._note_off_cmd, note, 0])
 
         if self.state == 'LESSON_SELECT':
             return
@@ -1463,6 +1721,8 @@ class Trainer:
         self.rend.button_led_off(BTN_PLAY)
         self.rend.button_led_off(BTN_STOP)
         self.rend.button_led_off(BTN_REC)
+        for btn_id, _ in BANK_BUTTONS:
+            self.rend.button_led_off(btn_id)
         try:
             self.device.device.write(self.device.led_buffer)
         except Exception:
@@ -1479,277 +1739,15 @@ class _ExitSignal(Exception):
 
 
 # =============================================================================
-# Built-in exercises
+# Load exercises from JSON
 # =============================================================================
 
-EXERCISES = [
-    # ------------------------------------------------------------------
-    # ROW 1 (pads 1-4): BASIC COORDINATION
-    # ------------------------------------------------------------------
-    {
-        "name": "1 — Rock Basic",
-        "bpm": 80, "steps": 16,
-        "timing_threshold_ms": 50,
-        "layers": [
-            {"name": "kick",  "pad": 1, "color": "FUCHSIA",
-             "pattern":  [1,0,0,0, 0,0,0,0, 1,0,0,0, 0,0,0,0],
-             "velocity": [100,0,0,0, 0,0,0,0, 100,0,0,0, 0,0,0,0]},
-            {"name": "snare", "pad": 2, "color": "YELLOW",
-             "pattern":  [0,0,0,0, 1,0,0,0, 0,0,0,0, 1,0,0,0],
-             "velocity": [0,0,0,0, 110,0,0,0, 0,0,0,0, 110,0,0,0]},
-        ],
-    },
-    {
-        "name": "2 — Rock + Quarter Hat",
-        "bpm": 80, "steps": 16,
-        "timing_threshold_ms": 50,
-        "layers": [
-            {"name": "kick",  "pad": 1, "color": "FUCHSIA",
-             "pattern":  [1,0,0,0, 0,0,0,0, 1,0,0,0, 0,0,0,0],
-             "velocity": [100,0,0,0, 0,0,0,0, 100,0,0,0, 0,0,0,0]},
-            {"name": "snare", "pad": 2, "color": "YELLOW",
-             "pattern":  [0,0,0,0, 1,0,0,0, 0,0,0,0, 1,0,0,0],
-             "velocity": [0,0,0,0, 110,0,0,0, 0,0,0,0, 110,0,0,0]},
-            {"name": "hihat", "pad": 3, "color": "LIGHT_ORANGE",
-             "pattern":  [1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0],
-             "velocity": [100,0,0,0, 80,0,0,0, 100,0,0,0, 80,0,0,0]},
-        ],
-    },
-    {
-        "name": "3 — Rock + 8th Hat",
-        "bpm": 85, "steps": 16,
-        "timing_threshold_ms": 45,
-        "layers": [
-            {"name": "kick",      "pad": 1, "color": "FUCHSIA",
-             "pattern":  [1,0,0,0, 0,0,0,0, 1,0,0,0, 0,0,0,0],
-             "velocity": [100,0,0,0, 0,0,0,0, 100,0,0,0, 0,0,0,0]},
-            {"name": "snare",     "pad": 2, "color": "YELLOW",
-             "pattern":  [0,0,0,0, 1,0,0,0, 0,0,0,0, 1,0,0,0],
-             "velocity": [0,0,0,0, 110,0,0,0, 0,0,0,0, 110,0,0,0]},
-            {"name": "hihat 8ths","pad": 3, "color": "LIGHT_ORANGE",
-             "pattern":  [1,0,1,0, 1,0,1,0, 1,0,1,0, 1,0,1,0],
-             "velocity": [100,0,60,0, 80,0,60,0, 100,0,60,0, 80,0,60,0]},
-        ],
-    },
-    {
-        "name": "4 — Feeling the And",
-        "bpm": 80, "steps": 16,
-        "timing_threshold_ms": 45,
-        "layers": [
-            {"name": "kick",       "pad": 1, "color": "FUCHSIA",
-             "pattern":  [1,0,0,0, 0,0,0,0, 1,0,0,0, 0,0,0,0],
-             "velocity": [100,0,0,0, 0,0,0,0, 100,0,0,0, 0,0,0,0]},
-            {"name": "snare",      "pad": 2, "color": "YELLOW",
-             "pattern":  [0,0,0,0, 1,0,0,0, 0,0,0,0, 1,0,0,0],
-             "velocity": [0,0,0,0, 110,0,0,0, 0,0,0,0, 110,0,0,0]},
-            {"name": "hihat ands", "pad": 3, "color": "LIGHT_ORANGE",
-             "pattern":  [0,0,1,0, 0,0,1,0, 0,0,1,0, 0,0,1,0],
-             "velocity": [0,0,80,0, 0,0,80,0, 0,0,80,0, 0,0,80,0]},
-        ],
-    },
-    # ------------------------------------------------------------------
-    # ROW 2 (pads 5-8): INDEPENDENCE & GROOVES
-    # ------------------------------------------------------------------
-    {
-        "name": "5 — Moving Kick",
-        "bpm": 75, "steps": 64,
-        "timing_threshold_ms": 50,
-        "layers": [
-            {"name": "kick",  "pad": 1, "color": "FUCHSIA",
-             "pattern":  [1,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
-                          0,0,0,0, 1,0,0,0, 0,0,0,0, 0,0,0,0,
-                          0,0,0,0, 0,0,0,0, 1,0,0,0, 0,0,0,0,
-                          0,0,0,0, 0,0,0,0, 0,0,0,0, 1,0,0,0],
-             "velocity": [100,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
-                          0,0,0,0, 100,0,0,0, 0,0,0,0, 0,0,0,0,
-                          0,0,0,0, 0,0,0,0, 100,0,0,0, 0,0,0,0,
-                          0,0,0,0, 0,0,0,0, 0,0,0,0, 100,0,0,0]},
-            {"name": "hihat", "pad": 3, "color": "LIGHT_ORANGE",
-             "pattern":  [1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0,
-                          1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0,
-                          1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0,
-                          1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0],
-             "velocity": [80,0,0,0, 80,0,0,0, 80,0,0,0, 80,0,0,0,
-                          80,0,0,0, 80,0,0,0, 80,0,0,0, 80,0,0,0,
-                          80,0,0,0, 80,0,0,0, 80,0,0,0, 80,0,0,0,
-                          80,0,0,0, 80,0,0,0, 80,0,0,0, 80,0,0,0]},
-        ],
-    },
-    {
-        "name": "6 — Moving And Kick",
-        "bpm": 70, "steps": 64,
-        "timing_threshold_ms": 50,
-        "layers": [
-            {"name": "kick",  "pad": 1, "color": "FUCHSIA",
-             "pattern":  [0,0,1,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
-                          0,0,0,0, 0,0,1,0, 0,0,0,0, 0,0,0,0,
-                          0,0,0,0, 0,0,0,0, 0,0,1,0, 0,0,0,0,
-                          0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,1,0],
-             "velocity": [0,0,100,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
-                          0,0,0,0, 0,0,100,0, 0,0,0,0, 0,0,0,0,
-                          0,0,0,0, 0,0,0,0, 0,0,100,0, 0,0,0,0,
-                          0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,100,0]},
-            {"name": "hihat", "pad": 3, "color": "LIGHT_ORANGE",
-             "pattern":  [1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0,
-                          1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0,
-                          1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0,
-                          1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0],
-             "velocity": [80,0,0,0, 80,0,0,0, 80,0,0,0, 80,0,0,0,
-                          80,0,0,0, 80,0,0,0, 80,0,0,0, 80,0,0,0,
-                          80,0,0,0, 80,0,0,0, 80,0,0,0, 80,0,0,0,
-                          80,0,0,0, 80,0,0,0, 80,0,0,0, 80,0,0,0]},
-        ],
-    },
-    {
-        "name": "7 — Ghost Notes",
-        "bpm": 75, "steps": 16,
-        "timing_threshold_ms": 45,
-        "layers": [
-            {"name": "kick",  "pad": 1, "color": "FUCHSIA",
-             "pattern":  [1,0,0,0, 0,0,0,0, 1,0,0,0, 0,0,1,0],
-             "velocity": [100,0,0,0, 0,0,0,0, 100,0,0,0, 0,0,80,0]},
-            {"name": "snare", "pad": 2, "color": "YELLOW",
-             "pattern":  [0,0,1,0, 1,0,1,0, 0,0,1,0, 1,0,0,0],
-             "velocity": [0,0,40,0, 110,0,40,0, 0,0,40,0, 110,0,0,0]},
-            {"name": "hihat", "pad": 3, "color": "LIGHT_ORANGE",
-             "pattern":  [1,0,1,0, 1,0,1,0, 1,0,1,0, 1,0,1,0],
-             "velocity": [100,0,50,0, 80,0,50,0, 100,0,50,0, 80,0,50,0]},
-        ],
-    },
-    {
-        "name": "8 — Boom Bap",
-        "bpm": 90, "steps": 16,
-        "timing_threshold_ms": 40,
-        "layers": [
-            {"name": "kick",     "pad": 1, "color": "FUCHSIA",
-             "pattern":  [1,0,0,0, 0,0,0,0, 1,0,1,0, 0,0,0,0],
-             "velocity": [110,0,0,0, 0,0,0,0, 100,0,90,0, 0,0,0,0]},
-            {"name": "snare",    "pad": 2, "color": "YELLOW",
-             "pattern":  [0,0,0,0, 1,0,0,0, 0,0,0,0, 1,0,0,0],
-             "velocity": [0,0,0,0, 110,0,0,0, 0,0,0,0, 110,0,0,0]},
-            {"name": "hihat",    "pad": 3, "color": "LIGHT_ORANGE",
-             "pattern":  [1,0,1,0, 1,0,1,0, 1,0,1,0, 1,0,1,0],
-             "velocity": [80,0,50,0, 80,0,50,0, 80,0,50,0, 80,0,50,0]},
-            {"name": "open hat", "pad": 4, "color": "LIGHT_ORANGE",
-             "pattern":  [0,0,0,0, 0,0,0,1, 0,0,0,0, 0,0,0,0],
-             "velocity": [0,0,0,0, 0,0,0,90, 0,0,0,0, 0,0,0,0]},
-        ],
-    },
-    # ------------------------------------------------------------------
-    # ROW 3 (pads 9-12): RUDIMENTS — 8TH NOTES
-    # ------------------------------------------------------------------
-    {
-        "name": "9 — Single Stroke 8ths",
-        "bpm": 80, "steps": 16,
-        "timing_threshold_ms": 45,
-        "layers": [
-            {"name": "R hand", "pad": 1, "color": "YELLOW",
-             "pattern":  [1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0],
-             "velocity": [100,0,0,0, 80,0,0,0, 100,0,0,0, 80,0,0,0]},
-            {"name": "L hand", "pad": 2, "color": "WARM_YELLOW",
-             "pattern":  [0,0,1,0, 0,0,1,0, 0,0,1,0, 0,0,1,0],
-             "velocity": [0,0,80,0, 0,0,80,0, 0,0,80,0, 0,0,80,0]},
-        ],
-    },
-    {
-        "name": "10 — Double Stroke 8ths",
-        "bpm": 75, "steps": 16,
-        "timing_threshold_ms": 45,
-        "layers": [
-            {"name": "R hand", "pad": 1, "color": "YELLOW",
-             "pattern":  [1,0,1,0, 0,0,0,0, 1,0,1,0, 0,0,0,0],
-             "velocity": [100,0,90,0, 0,0,0,0, 100,0,90,0, 0,0,0,0]},
-            {"name": "L hand", "pad": 2, "color": "WARM_YELLOW",
-             "pattern":  [0,0,0,0, 1,0,1,0, 0,0,0,0, 1,0,1,0],
-             "velocity": [0,0,0,0, 90,0,80,0, 0,0,0,0, 90,0,80,0]},
-        ],
-    },
-    {
-        "name": "11 — Paradiddle 8ths",
-        "bpm": 70, "steps": 16,
-        "timing_threshold_ms": 45,
-        "layers": [
-            {"name": "R hand", "pad": 1, "color": "YELLOW",
-             "pattern":  [1,0,0,0, 1,0,1,0, 0,0,1,0, 0,0,0,0],
-             "velocity": [100,0,0,0, 90,0,90,0, 0,0,80,0, 0,0,0,0]},
-            {"name": "L hand", "pad": 2, "color": "WARM_YELLOW",
-             "pattern":  [0,0,1,0, 0,0,0,0, 1,0,0,0, 1,0,1,0],
-             "velocity": [0,0,80,0, 0,0,0,0, 90,0,0,0, 90,0,80,0]},
-        ],
-    },
-    {
-        "name": "12 — Single Stroke 16ths",
-        "bpm": 70, "steps": 16,
-        "timing_threshold_ms": 40,
-        "layers": [
-            {"name": "R hand", "pad": 1, "color": "YELLOW",
-             "pattern":  [1,0,1,0, 1,0,1,0, 1,0,1,0, 1,0,1,0],
-             "velocity": [100,0,80,0, 90,0,80,0, 100,0,80,0, 90,0,80,0]},
-            {"name": "L hand", "pad": 2, "color": "WARM_YELLOW",
-             "pattern":  [0,1,0,1, 0,1,0,1, 0,1,0,1, 0,1,0,1],
-             "velocity": [0,80,0,80, 0,80,0,80, 0,80,0,80, 0,80,0,80]},
-        ],
-    },
-    # ------------------------------------------------------------------
-    # ROW 4 (pads 13-16): ADVANCED RUDIMENTS
-    # ------------------------------------------------------------------
-    {
-        "name": "13 — Double Stroke 16ths",
-        "bpm": 65, "steps": 16,
-        "timing_threshold_ms": 40,
-        "layers": [
-            {"name": "R hand", "pad": 1, "color": "YELLOW",
-             "pattern":  [1,1,0,0, 1,1,0,0, 1,1,0,0, 1,1,0,0],
-             "velocity": [100,90,0,0, 90,80,0,0, 100,90,0,0, 90,80,0,0]},
-            {"name": "L hand", "pad": 2, "color": "WARM_YELLOW",
-             "pattern":  [0,0,1,1, 0,0,1,1, 0,0,1,1, 0,0,1,1],
-             "velocity": [0,0,90,80, 0,0,90,80, 0,0,90,80, 0,0,90,80]},
-        ],
-    },
-    {
-        "name": "14 — Paradiddle 16ths",
-        "bpm": 60, "steps": 16,
-        "timing_threshold_ms": 40,
-        "layers": [
-            {"name": "R hand", "pad": 1, "color": "YELLOW",
-             "pattern":  [1,0,1,1, 0,1,0,0, 1,0,1,1, 0,1,0,0],
-             "velocity": [100,0,90,90, 0,80,0,0, 100,0,90,90, 0,80,0,0]},
-            {"name": "L hand", "pad": 2, "color": "WARM_YELLOW",
-             "pattern":  [0,1,0,0, 1,0,1,1, 0,1,0,0, 1,0,1,1],
-             "velocity": [0,80,0,0, 90,0,90,80, 0,80,0,0, 90,0,90,80]},
-        ],
-    },
-    {
-        "name": "15 — Triplet Singles",
-        "bpm": 80, "steps": 12, "subdivisions": 3,
-        "timing_threshold_ms": 45,
-        "layers": [
-            {"name": "R hand", "pad": 1, "color": "YELLOW",
-             "pattern":  [1,0,1, 0,1,0, 1,0,1, 0,1,0],
-             "velocity": [100,0,80, 0,80,0, 100,0,80, 0,80,0]},
-            {"name": "L hand", "pad": 2, "color": "WARM_YELLOW",
-             "pattern":  [0,1,0, 1,0,1, 0,1,0, 1,0,1],
-             "velocity": [0,80,0, 80,0,80, 0,80,0, 80,0,80]},
-        ],
-    },
-    {
-        "name": "16 — Paradiddle 32nds",
-        "bpm": 50, "steps": 32, "subdivisions": 8,
-        "timing_threshold_ms": 35,
-        "layers": [
-            {"name": "R hand", "pad": 1, "color": "YELLOW",
-             "pattern":  [1,0,1,1, 0,1,0,0, 1,0,1,1, 0,1,0,0,
-                          1,0,1,1, 0,1,0,0, 1,0,1,1, 0,1,0,0],
-             "velocity": [100,0,90,90, 0,80,0,0, 100,0,90,90, 0,80,0,0,
-                          100,0,90,90, 0,80,0,0, 100,0,90,90, 0,80,0,0]},
-            {"name": "L hand", "pad": 2, "color": "WARM_YELLOW",
-             "pattern":  [0,1,0,0, 1,0,1,1, 0,1,0,0, 1,0,1,1,
-                          0,1,0,0, 1,0,1,1, 0,1,0,0, 1,0,1,1],
-             "velocity": [0,80,0,0, 90,0,90,80, 0,80,0,0, 90,0,90,80,
-                          0,80,0,0, 90,0,90,80, 0,80,0,0, 90,0,90,80]},
-        ],
-    },
-]
+EXERCISES_JSON = Path(__file__).parent / "exercises.json"
+
+def _load_exercises():
+    with open(EXERCISES_JSON) as f:
+        raw = json.load(f)
+    return [ex for ex in raw if 'name' in ex]
 
 
 
@@ -1760,16 +1758,17 @@ EXERCISES = [
 def main():
     args = sys.argv[1:]
 
+    all_exercises = _load_exercises()
+
     if '--list' in args:
         print("\n  Exercises:\n")
-        for i, ex in enumerate(EXERCISES):
+        for i, ex in enumerate(all_exercises):
             n = len(ex['layers'])
-            print(f"  {i+1}. {ex['name']}  ({ex['bpm']} BPM, {n} instruments)")
+            print(f"  {i+1:2d}. {ex['name']}  ({ex['bpm']} BPM, {n} layers)")
         print(f"\nUsage: python3 {sys.argv[0]} [lesson.json]")
         return
 
-    # Load exercises
-    exercise_list = [Exercise(ex) for ex in EXERCISES]
+    exercise_list = [Exercise(ex) for ex in all_exercises]
 
     # Load custom JSON exercise if provided
     for a in args:
@@ -1830,16 +1829,38 @@ def main():
     device.device.set_nonblocking(False)
 
     print("  Controls:")
+    print("    PAD MODE / KEYBOARD / CHORDS / STEP — switch bank")
     print("    REC      — demo (listen to pattern)")
     print("    PLAY     — start exercise")
     print("    STOP     — back")
+    print("    ENCODER  — push to adjust BPM")
     print("    Ctrl+C   — quit")
+    print()
+    print(f"  {len(exercise_list)} exercises in {len(BANK_NAMES)} banks:")
+    for i, name in enumerate(BANK_NAMES):
+        base = i * EXERCISES_PER_BANK
+        n = min(EXERCISES_PER_BANK, len(exercise_list) - base)
+        if n > 0:
+            ch = i + 1
+            print(f"    {name:15s}  {n:2d} exercises  →  MIDI ch {ch}")
     print()
 
     debug = '--debug' in args
-    trainer = Trainer(device, exercise_list, debug=debug)
+
+    student_name = None
+    for i, a in enumerate(args):
+        if a == '--student' and i + 1 < len(args):
+            student_name = args[i + 1]
+            break
+
+    stats = StatsWriter(student_name) if student_name else None
+
+    trainer = Trainer(device, exercise_list, debug=debug, stats=stats)
     if debug:
         print("  DEBUG mode ON")
+    if stats:
+        print(f"  Student: {student_name} (session {stats.session})")
+        print(f"  Stats: {stats.path}")
     print(f"  MIDI: '{MIDI_PORT_NAME}'")
     print(f"     (подключи в DAW к drum rack)")
     print()

@@ -441,7 +441,7 @@ class DeviceBridge:
                     note = base_note + self.octave_offset
 
                     # Check for press events
-                    if event_type in [PadEventType.PRESS_ON, PadEventType.NOTE_ON]:
+                    if event_type == PadEventType.NOTE_ON:
                         if velocity < VELOCITY_THRESHOLD:
                             continue
 

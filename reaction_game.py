@@ -48,8 +48,7 @@ def decode_pad_events(data):
 
         event_type = event_byte & 0xf0
 
-        # Press events
-        if event_type in [PadEventType.PRESS_ON, PadEventType.NOTE_ON]:
+        if event_type == PadEventType.NOTE_ON:
             events.append(pad_idx)
 
     return events

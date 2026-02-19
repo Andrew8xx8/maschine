@@ -452,7 +452,6 @@ class DeviceBridge:
         note_on_cmd = 0x90 + midi_ch
 
         # Pre-extract constants as locals
-        _PRESS_ON = PadEventType.PRESS_ON
         _NOTE_ON = PadEventType.NOTE_ON
         _PRESS_OFF = PadEventType.PRESS_OFF
         _NOTE_OFF = PadEventType.NOTE_OFF
@@ -559,7 +558,7 @@ class DeviceBridge:
                     note += octave_offset
 
                     # Press events
-                    if event_type == _PRESS_ON or event_type == _NOTE_ON:
+                    if event_type == _NOTE_ON:
                         if _debug:
                             note_name = note_to_name(note)
                             if velocity < _VEL_THR:

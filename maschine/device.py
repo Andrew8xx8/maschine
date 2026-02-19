@@ -294,8 +294,7 @@ class MaschineDevice:
 
             event_type = event_byte & 0xf0
 
-            # Check for press events
-            if event_type in [PadEventType.PRESS_ON, PadEventType.NOTE_ON]:
+            if event_type == PadEventType.NOTE_ON:
                 if 0 <= pad_idx < PAD_COUNT:
                     pressed.append(pad_idx)
 
