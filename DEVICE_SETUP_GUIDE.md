@@ -36,7 +36,7 @@
 ### Шаг 1: Запустите настройку
 
 ```bash
-cd /Users/avk/p/maschine
+cd /path/to/maschine
 python3 device_setup.py
 ```
 
@@ -97,7 +97,7 @@ python3 device_setup.py
 
 💾 Сохранить эту конфигурацию? (y/n): y
 
-✅ Конфигурация сохранена: /Users/avk/.maschine_device_config.json
+✅ Конфигурация сохранена: ~/.maschine_device_config.json
 ```
 
 **Готово!** 🎉
@@ -108,7 +108,7 @@ python3 device_setup.py
 
 Настройки сохраняются в:
 ```
-/Users/avk/.maschine_device_config.json
+~/.maschine_device_config.json
 ```
 
 **Содержимое:**
@@ -173,7 +173,7 @@ python3 device_setup.py --show
   Device 3 → Serial: 0001XXXX
   Device 4 → Serial: 0001YYYY
 
-📁 Файл конфигурации: /Users/avk/.maschine_device_config.json
+📁 Файл конфигурации: ~/.maschine_device_config.json
 ```
 
 ---

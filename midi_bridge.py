@@ -280,7 +280,6 @@ class DeviceBridge:
         self.midi_channel = device_num - 1
         self.midi_out = midi_out
         self.active_notes = set()
-        self.event_count = 0
         self.running = False
         self.thread = None
 
@@ -326,7 +325,7 @@ class DeviceBridge:
 
         # Log bank change
         offset_str = f"+{self.octave_offset}" if self.octave_offset > 0 else "±0"
-        print(f"🎹 D{self.device_num}: Bank → {bank_name} ({offset_str} semitones)")
+        # print(f"🎹 D{self.device_num}: Bank → {bank_name} ({offset_str} semitones)")
 
     def _update_bank_leds(self):
         """Обновить подсветку кнопок банков"""
@@ -447,14 +446,9 @@ class DeviceBridge:
                             continue
 
                         self.send_note_on(note, velocity)
-                        self.event_count += 1
 
                         # Light up pad with active color (white)
                         self.device.set_pad_light(pad_idx, PAD_ACTIVE_COLOR, brightness=BRIGHTNESS_BRIGHT, on=True)
-
-                        # Print without flush (buffered output for performance)
-                        note_name = self._note_to_name(note)
-                        print(f"🎵 D{self.device_num} [Ch{self.midi_channel+1}] Pad {pad_idx:2d}→{note_name} v{velocity:3d}")
 
                     # Check for release events
                     elif event_type in [PadEventType.PRESS_OFF, PadEventType.NOTE_OFF]:
@@ -580,13 +574,6 @@ class MIDIBridge:
             print("\n🛑 Остановка...")
             for bridge in self.device_bridges:
                 bridge.stop()
-
-            print("\n📊 Статистика:")
-            total = 0
-            for bridge in self.device_bridges:
-                print(f"   Device {bridge.device_num}: {bridge.event_count} событий")
-                total += bridge.event_count
-            print(f"   ИТОГО: {total}")
 
             print("\n   Очистка...")
             for bridge in self.device_bridges:

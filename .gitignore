@@ -15,6 +15,7 @@ ENV/
 *.swp
 *.swo
 *~
+*.code-workspace
 
 # OS
 .DS_Store
@@ -23,4 +24,3 @@ Thumbs.db
 # Project specific
 *.log
 .pytest_cache/
-

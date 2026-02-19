@@ -49,6 +49,24 @@ from .device_config import (
     has_config,
 )
 from .screen import Screen
+from .midi import (
+    PAD_TO_NOTE,
+    NOTE_TO_PAD,
+    OCTAVE_BANKS,
+    BUTTON_LED_MAP,
+    NOTE_NAMES,
+    note_to_name,
+    name_to_note,
+    load_image_to_screen,
+    display_logo_on_devices,
+    setup_device_mapping_interactive,
+    # Pad display utilities
+    PAD_FONT,
+    PAD_FONT_COMPACT,
+    text_to_pad_bitmap,
+    get_text_width,
+    display_text_on_pads,
+)
 
 __version__ = "1.0.0"
 __author__ = "Maschine MK3 Project"
@@ -83,5 +101,24 @@ __all__ = [
     "sort_devices_by_config",
     "get_config_path",
     "has_config",
+
+    # MIDI utilities
+    "PAD_TO_NOTE",
+    "NOTE_TO_PAD",
+    "OCTAVE_BANKS",
+    "BUTTON_LED_MAP",
+    "NOTE_NAMES",
+    "note_to_name",
+    "name_to_note",
+    "load_image_to_screen",
+    "display_logo_on_devices",
+    "setup_device_mapping_interactive",
+
+    # Pad display utilities
+    "PAD_FONT",
+    "PAD_FONT_COMPACT",
+    "text_to_pad_bitmap",
+    "get_text_width",
+    "display_text_on_pads",
 ]
 

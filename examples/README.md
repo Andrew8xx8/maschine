@@ -1,108 +1,80 @@
-# Maschine Mikro MK3 Examples
+# Maschine Mikro MK3 — Примеры
 
-Simple, focused examples demonstrating different aspects of the MK3 controller.
+Простые примеры для изучения работы с контроллером.
 
-## Examples
+## 📚 Примеры
 
-### 1. simple_monitor.py
+### simple_monitor.py
 
-**Purpose:** Minimal pad event monitoring without LED control.
+Минимальный мониторинг пэдов без LED.
 
-**Features:**
-- Device discovery and connection
-- Basic initialization handshake
-- Pad event decoding
-- Clean, commented code (~90 lines)
-
-**Usage:**
 ```bash
-python simple_monitor.py
+python examples/simple_monitor.py
 ```
 
-**Good for:**
-- Learning the basics
-- Starting point for custom applications
-- Understanding the minimal requirements
+**Хорош для:**
+- Изучения основ
+- Старта своих проектов
+- Понимания минимальных требований
 
 ---
 
-### 2. led_demo.py
+### led_demo.py
 
-**Purpose:** Demonstrate the complete LED color palette system.
+Демонстрация всех 17 цветов и 3 уровней яркости.
 
-**Features:**
-- All 17 colors from the palette
-- 3 brightness levels (Dim, Normal, Bright)
-- Sequential pad lighting
-- Clean demonstration of LED protocol
-
-**Usage:**
 ```bash
-python led_demo.py
+python examples/led_demo.py
 ```
 
-**Good for:**
-- Understanding the color palette
-- Testing LED functionality
-- Visualizing brightness levels
-- Learning LED buffer structure
+**Хорош для:**
+- Понимания цветовой палитры
+- Тестирования LED
+- Изучения LED протокола
 
 ---
 
-## Running the Examples
+## 🚀 Запуск
 
-All examples assume you have:
+```bash
+# 1. Активируй venv
+cd /path/to/maschine
+source venv/bin/activate
 
-1. **Installed dependencies:**
-   ```bash
-   cd /Users/avk/p/maschine
-   source venv/bin/activate
-   pip install -r requirements.txt
-   ```
+# 2. Убей NI Agent
+killall NIHardwareAgent
 
-2. **Killed NIHardwareAgent** (macOS/Linux):
-   ```bash
-   killall NIHardwareAgent
-   ```
-
-3. **Connected your Maschine Mikro MK3** via USB
+# 3. Запусти пример
+python examples/simple_monitor.py
+```
 
 ---
 
-## Building Your Own
+## 🛠️ Создание своих скриптов
 
-These examples are designed to be:
-- **Self-contained** - Each file is independent
-- **Well-commented** - Explanation of each section
-- **Minimal** - Only essential code, easy to understand
-- **Modifiable** - Good starting points for your own projects
-
-### Template Structure
+Шаблон:
 
 ```python
 #!/usr/bin/env python3
-"""Your description here"""
+"""Описание скрипта"""
 
-import hid
-import time
-import os
-
-# Constants
-VENDOR_ID = 0x17cc
-PRODUCT_ID = 0x1700
-
-def init_device(device):
-    """Initialize device with handshakes"""
-    # ... initialization code ...
-    pass
+from maschine import find_devices, Color
 
 def main():
-    """Main program logic"""
-    # 1. Find device
-    # 2. Connect
-    # 3. Initialize
-    # 4. Event loop
-    pass
+    # Найти устройства
+    devices = find_devices(max_count=4)
+    if not devices:
+        print("Устройства не найдены")
+        return
+
+    device = devices[0]
+    print(f"Подключено: {device.serial}")
+
+    # Твой код здесь
+    device.set_all_pads(Color.CYAN)
+
+    # Закрытие
+    device.close()
 
 if __name__ == "__main__":
     main()
@@ -110,15 +82,10 @@ if __name__ == "__main__":
 
 ---
 
-## Next Steps
+## 📖 Далее
 
-After exploring these examples, check out:
+После изучения примеров смотри:
 
-- **maschine_controller.py** - Full-featured multi-device controller
-- **PROTOCOL.md** - Complete protocol documentation
-- **test_mk3_correct.py** - Protocol verification and testing
-
-## Questions?
-
-See the main README.md for troubleshooting and additional information.
-
+- `midi_bridge.py` — MIDI контроллер
+- `PROTOCOL.md` — документация протокола
+- Основной `README.md`
