@@ -756,7 +756,7 @@ class Trainer:
     # Read thread — HID input, pad scoring, MIDI sends
     # =====================================================================
 
-    VEL_THRESHOLD = 5
+    VEL_THRESHOLD = 50
     HIT_PROTECT_SEC = 0.15   # 150ms: don't overwrite GREEN/YELLOW feedback
 
     def _read_loop(self):
@@ -798,16 +798,23 @@ class Trainer:
                         continue
 
                     etype = event_byte & 0xf0
+                    vel12 = ((event_byte & 0x0f) << 8) | vel_low
+                    vel = min(127, vel12 >> 5)
 
                     if etype == _NOTE_ON:
-                        vel12 = ((event_byte & 0x0f) << 8) | vel_low
-                        vel = min(127, vel12 >> 5)
                         if vel < _vel_thr:
                             continue
 
                         self._perf_pad_events += 1
                         self._on_pad_hit(pad_idx, vel, now)
                         led_changed = True
+
+                    elif etype == 0x00 and _debug and vel > 0:
+                        layer_idx = self._pad_layer.get(pad_idx)
+                        if layer_idx is not None:
+                            layer = self.exercise.layers[layer_idx] if self.exercise else None
+                            upad = layer.user_pad if layer else pad_idx
+                            print(f"  [PRESS_ON] pad {upad} v={vel:3d} (aftertouch, ignored)")
 
                     elif etype == _PRESS_OFF or etype == _NOTE_OFF:
                         self._on_pad_release(pad_idx)
@@ -835,7 +842,10 @@ class Trainer:
                     self._all_notes_off()
                     self._enter_exercise_idle()
 
-                if self.state in ('EX_DEMO', 'EX_PLAYING'):
+                if self.state == 'EX_COUNTDOWN':
+                    self._tick_countdown()
+                    time.sleep(0.001)
+                elif self.state in ('EX_DEMO', 'EX_PLAYING'):
                     self._tick_metronome()
                     self._perf_tick_count += 1
                     time.sleep(0.001)
@@ -1117,45 +1127,6 @@ class Trainer:
     # State: EX_COUNTDOWN — 4 beats then play
     # =====================================================================
 
-    def _do_countin(self):
-        """Blocking 4-beat count-in at current BPM. Returns exercise origin
-        time, or None if cancelled by STOP."""
-        beat_dur = 60.0 / self._current_bpm
-        layers = self.exercise.layers
-        print("  ⏳ Отсчёт...", end='', flush=True)
-
-        countdown_origin = time.perf_counter()
-
-        for beat in range(self.COUNTDOWN_BEATS):
-            if self._action_stop:
-                self._action_stop = False
-                print(" отмена")
-                return None
-
-            for i in range(16):
-                self.rend.pad(i, Color.WHITE, BRIGHTNESS_BRIGHT)
-            self.rend.strip_playhead(beat / self.COUNTDOWN_BEATS)
-            self._signal_led()
-
-            note = METRO_NOTE_ACCENT if beat == 0 else METRO_NOTE_NORMAL
-            vel = METRO_VEL_ACCENT if beat == 0 else METRO_VEL_NORMAL
-            self._midi_send([MIDI_NOTE_ON_CH10, note, vel])
-
-            time.sleep(beat_dur * 0.15)
-
-            self.rend.clear_pads()
-            for layer in layers:
-                self.rend.pad(layer.pad_idx, layer.color, BRIGHTNESS_BRIGHT)
-            self._signal_led()
-            self._midi_send([MIDI_NOTE_OFF_CH10, note, 0])
-
-            remaining = countdown_origin + (beat + 1) * beat_dur - time.perf_counter()
-            if remaining > 0:
-                time.sleep(remaining)
-            print(f" {beat + 1}", end='', flush=True)
-
-        return countdown_origin + self.COUNTDOWN_BEATS * beat_dur
-
     def _enter_countdown(self):
         self.state = 'EX_COUNTDOWN'
         if self.clock:
@@ -1176,26 +1147,66 @@ class Trainer:
         self.rend.button_led(BTN_PLAY, Color.YELLOW, BRIGHTNESS_BRIGHT)
         self._signal_led()
 
-        exercise_origin = self._do_countin()
-        if exercise_origin is None:
-            self._enter_exercise_idle()
+        beat_dur = 60.0 / self._current_bpm
+        self._ci_origin = time.perf_counter()
+        self._ci_exercise_origin = self._ci_origin + self.COUNTDOWN_BEATS * beat_dur
+        self._ci_beat_dur = beat_dur
+        self._ci_beat = -1
+        self._ci_flash_off_done = True
+
+        print("  ⏳ Отсчёт...", end='', flush=True)
+
+    def _tick_countdown(self):
+        """Non-blocking count-in: called from main loop at ~1 kHz.
+        Fires metronome clicks, pad flashes, and transitions to
+        EX_PLAYING with zero dead-zone."""
+        now = time.perf_counter()
+
+        if now >= self._ci_exercise_origin:
+            # Count-in complete — start clock+state with <1 ms precision.
+            self._last_step = -1
+            self._last_loop = 0
+            self._pass_base = 0
+            self.clock.start(self._ci_exercise_origin)
+            self.state = 'EX_PLAYING'
+            self._enter_playing()
             return
 
-        self._enter_playing(origin=exercise_origin)
+        elapsed = now - self._ci_origin
+        beat = int(elapsed / self._ci_beat_dur)
+        beat_phase = (elapsed - beat * self._ci_beat_dur) / self._ci_beat_dur
+
+        if beat != self._ci_beat:
+            self._ci_beat = beat
+            self._ci_flash_off_done = False
+
+            for i in range(16):
+                self.rend.pad(i, Color.WHITE, BRIGHTNESS_BRIGHT)
+            self.rend.strip_playhead(beat / self.COUNTDOWN_BEATS)
+            self._signal_led()
+
+            note = METRO_NOTE_ACCENT if beat == 0 else METRO_NOTE_NORMAL
+            vel = METRO_VEL_ACCENT if beat == 0 else METRO_VEL_NORMAL
+            self._midi_send([MIDI_NOTE_ON_CH10, note, vel])
+
+            print(f" {beat + 1}", end='', flush=True)
+
+        elif not self._ci_flash_off_done and beat_phase > 0.15:
+            self._ci_flash_off_done = True
+            self.rend.clear_pads()
+            for layer in self.exercise.layers:
+                self.rend.pad(layer.pad_idx, layer.color, BRIGHTNESS_BRIGHT)
+            self._signal_led()
+            note = METRO_NOTE_ACCENT if beat == 0 else METRO_NOTE_NORMAL
+            self._midi_send([MIDI_NOTE_OFF_CH10, note, 0])
 
     # =====================================================================
     # State: EX_PLAYING — user plays, metronome + loop meter grading
     # =====================================================================
 
-    def _enter_playing(self, origin=None):
-        # Time-critical: state + clock FIRST so the read thread
-        # can score hits that land right on beat 1.
-        self.state = 'EX_PLAYING'
-        self._last_step = -1
-        self._last_loop = 0
-        self.clock.start(origin)
-
-        # Visual setup (non-time-critical)
+    def _enter_playing(self):
+        # State + clock already set by _tick_countdown with <1 ms precision.
+        # Visual setup only (non-time-critical).
         self._draw_resting()
         self._clear_loop_meter()
         self.rend.button_led(BTN_PLAY, Color.GREEN, BRIGHTNESS_BRIGHT)
@@ -1392,23 +1403,8 @@ class Trainer:
         self._pass_start_time = time.perf_counter()
 
         if bpm_changed:
-            self.state = 'EX_COUNTDOWN'
-            self.clock.stop()
-            self._all_notes_off()
-            self._pending_offs.clear()
-            self._hit_protect.clear()
             self.clock.set_bpm(self._current_bpm)
-
-            exercise_origin = self._do_countin()
-            if exercise_origin is None:
-                self._enter_exercise_idle()
-                return
-
-            self.state = 'EX_PLAYING'
-            self._last_step = -1
-            self._last_loop = 0
-            self._pass_base = 0
-            self.clock.start(exercise_origin)
+            self._enter_countdown()
 
     def _clear_loop_meter(self):
         """Turn off all loop meter pads and show first one as 'current'."""
