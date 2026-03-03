@@ -99,6 +99,7 @@ BTN_PLAY     = 22
 BTN_REC      = 23
 BTN_STOP     = 24
 
+BTN_SHIFT    = 25
 BTN_PAD_MODE = 27
 BTN_KEYBOARD = 28
 BTN_CHORDS   = 29
@@ -106,12 +107,12 @@ BTN_STEP     = 30
 
 EXERCISES_PER_BANK = 16
 BANK_BUTTONS = (
-    (BTN_PAD_MODE, 0),   # Beginner
-    (BTN_KEYBOARD, 1),   # Intermediate
-    (BTN_CHORDS,   2),   # Pro
-    (BTN_STEP,     3),   # Virtuoso
+    (BTN_PAD_MODE, 0),   # Beat (Level I)
+    (BTN_KEYBOARD, 1),   # Live (Level II)
+    (BTN_CHORDS,   2),   # Pro (optional)
+    (BTN_STEP,     3),   # Drums (Level III)
 )
-BANK_NAMES = ('Beginner', 'Intermediate', 'Pro', 'Virtuoso')
+BANK_NAMES = ('Beat (I)', 'Live (II)', 'Pro (opt)', 'Drums (III)')
 
 # Button N → HID report 0x01 byte index and bit mask (pre-computed)
 def _btn_byte_mask(btn_id):
@@ -119,7 +120,7 @@ def _btn_byte_mask(btn_id):
 
 _BTN_MAP = {
     btn: _btn_byte_mask(btn)
-    for btn in (BTN_PLAY, BTN_REC, BTN_STOP,
+    for btn in (BTN_PLAY, BTN_REC, BTN_STOP, BTN_SHIFT,
                 BTN_PAD_MODE, BTN_KEYBOARD, BTN_CHORDS, BTN_STEP)
 }
 
@@ -318,6 +319,7 @@ class Layer:
         self.velocities = data.get('velocity',
                                    [100 if h else 0 for h in self.pattern])
         self.hits_per_loop = sum(1 for p in self.pattern if p != 0)
+        self.hit_steps = tuple(s for s, p in enumerate(self.pattern) if p != 0)
 
     @property
     def steps(self):
@@ -700,11 +702,14 @@ class Trainer:
         self._note_on_cmd = 0x90
         self._note_off_cmd = 0x80
 
+        self._locked_mode = False  # SHIFT toggles: lock exercises by progress
+
         self._action_play = False
         self._action_stop = False
         self._action_rec = False
         self._action_select_exercise = -1
         self._action_bank_switch = -1
+        self._action_shift_toggle = False
 
         self._enc_last_pos = None
         self._enc_pressed = False
@@ -880,6 +885,16 @@ class Trainer:
 
     def _process_actions(self):
         """Consume action flags set by the read thread."""
+        # SHIFT: toggle locked mode (only in LESSON_SELECT)
+        if self._action_shift_toggle:
+            self._action_shift_toggle = False
+            if self.state == 'LESSON_SELECT':
+                self._locked_mode = not self._locked_mode
+                mode_str = "ON (progress lock)" if self._locked_mode else "OFF (free)"
+                print(f"  🔒 Locked mode: {mode_str}")
+                self._enter_lesson_select()
+            return
+
         # Bank switch (only in LESSON_SELECT)
         bank = self._action_bank_switch
         if bank >= 0:
@@ -894,6 +909,11 @@ class Trainer:
         if ex_idx >= 0:
             self._action_select_exercise = -1
             if self.state == 'LESSON_SELECT':
+                # In locked mode, check if exercise is unlocked
+                if self._locked_mode:
+                    if not self._is_exercise_unlocked(ex_idx):
+                        print(f"  🔒 Exercise locked — complete previous first")
+                        return
                 self._enter_exercise_idle(ex_idx)
             return
 
@@ -977,6 +997,29 @@ class Trainer:
         active_btn = BANK_BUTTONS[self._current_bank][0]
         self.rend.button_led(active_btn, Color.WHITE, BRIGHTNESS_BRIGHT)
 
+    def _is_exercise_unlocked(self, ex_idx):
+        """Check if exercise is unlocked based on previous progress.
+        
+        Rules:
+        - First exercise in each row (slots 0, 4, 8, 12) is always unlocked
+        - Other exercises require previous exercise in row to be green/yellow
+        """
+        if not self.stats:
+            return True
+        
+        slot_in_bank = ex_idx % EXERCISES_PER_BANK
+        # First exercise in each row is always unlocked
+        if slot_in_bank % 4 == 0:
+            return True
+        
+        # Check previous exercise in the row
+        prev_idx = ex_idx - 1
+        progress = self.stats.last_results()
+        prev_grade = progress.get(prev_idx)
+        
+        # Unlocked if previous is green or yellow (passed)
+        return prev_grade in ('green', 'yellow')
+
     # =====================================================================
     # State: LESSON_SELECT — pick exercise by pressing a pad
     # =====================================================================
@@ -1004,7 +1047,15 @@ class Trainer:
                 break
             pidx = user_to_idx(slot + 1)
             grade = progress.get(ex_idx)
-            if grade:
+            
+            # Check if locked in locked mode
+            is_locked = self._locked_mode and not self._is_exercise_unlocked(ex_idx)
+            
+            if is_locked:
+                # Locked: dim red
+                color = Color.RED
+                brightness = BRIGHTNESS_DIM
+            elif grade:
                 color = _GRADE_COLOR.get(grade, Color.WHITE)
                 brightness = BRIGHTNESS_BRIGHT
             else:
@@ -1016,6 +1067,11 @@ class Trainer:
         self.rend.button_led_off(BTN_PLAY)
         self.rend.button_led_off(BTN_STOP)
         self.rend.button_led_off(BTN_REC)
+        # SHIFT LED shows locked mode state
+        if self._locked_mode:
+            self.rend.button_led(BTN_SHIFT, Color.RED, BRIGHTNESS_BRIGHT)
+        else:
+            self.rend.button_led_off(BTN_SHIFT)
         self._update_bank_leds()
         self._signal_led()
 
@@ -1024,8 +1080,9 @@ class Trainer:
 
         _GRADE_EMOJI = {'green': '🟢', 'yellow': '🟡', 'red': '🔴'}
         bank_name = BANK_NAMES[bank] if bank < len(BANK_NAMES) else f"Bank {bank}"
+        lock_str = " 🔒" if self._locked_mode else ""
         print(f"\n{'=' * 56}")
-        print(f"  {bank_name}  (MIDI ch {self._midi_channel + 1})")
+        print(f"  {bank_name}  (MIDI ch {self._midi_channel + 1}){lock_str}")
         print(f"{'=' * 56}")
         for slot in range(EXERCISES_PER_BANK):
             ex_idx = base + slot
@@ -1033,9 +1090,17 @@ class Trainer:
                 break
             ex = self.exercises[ex_idx]
             grade = progress.get(ex_idx)
-            emoji = _GRADE_EMOJI.get(grade, '⬜')
+            is_locked = self._locked_mode and not self._is_exercise_unlocked(ex_idx)
+            if is_locked:
+                emoji = '🔒'
+            else:
+                emoji = _GRADE_EMOJI.get(grade, '⬜')
             subs_label = f" [{ex.subdivisions}/beat]" if ex.subdivisions != 4 else ""
             print(f"  pad {slot + 1:2d} = {emoji} {ex.name}{subs_label}")
+        if self._locked_mode:
+            print(f"\n  SHIFT = toggle lock off")
+        else:
+            print(f"\n  SHIFT = toggle progress lock")
         print()
 
     # =====================================================================
@@ -1534,6 +1599,15 @@ class Trainer:
                 self._signal_wake()
             self._btn[btn_id] = pressed
 
+        # SHIFT: toggle locked mode (only in LESSON_SELECT)
+        byte_idx, mask = _BTN_MAP[BTN_SHIFT]
+        shift_pressed = (data[byte_idx] & mask) != 0
+        shift_was = self._btn.get(BTN_SHIFT, False)
+        if shift_pressed and not shift_was:
+            self._action_shift_toggle = True
+            self._signal_wake()
+        self._btn[BTN_SHIFT] = shift_pressed
+
         if len(data) >= 8:
             self._process_encoder(data)
 
@@ -1586,11 +1660,15 @@ class Trainer:
                 self._signal_wake()
             return
 
+        exercise = self.exercise
+        if exercise is None:
+            return
+
         layer_idx = self._pad_layer.get(pad_idx)
         if layer_idx is None:
             return
 
-        layer = self.exercise.layers[layer_idx]
+        layer = exercise.layers[layer_idx]
         note = layer.midi_note
 
         self._midi_send([self._note_on_cmd, note, velocity])
@@ -1610,28 +1688,27 @@ class Trainer:
         best_off = float('inf')
         best_loop = None
 
-        loop = self.clock.current_loop
+        clock = self.clock
+        loop = clock.current_loop
         loops_to_check = [loop, loop + 1]
         if loop > 0:
             loops_to_check.append(loop - 1)
 
         for check_loop in loops_to_check:
-            for s in range(self.exercise.steps):
-                if not layer.hit_at(s):
-                    continue
-                off = self.clock.offset_ms(hit_time, s, check_loop)
+            for s in layer.hit_steps:
+                off = clock.offset_ms(hit_time, s, check_loop)
                 if abs(off) < abs(best_off):
                     best_off = off
                     best_step = s
                     best_loop = check_loop
 
-        step = self.clock.current_step
+        step = clock.current_step
         if best_step is not None and abs(best_off) < self.HIT_WINDOW_MS:
             slot = best_loop - self._pass_base
             self.tracker.record(layer_idx, slot, best_step, best_off, velocity)
             if best_step == 0 and slot > 0:
                 self.tracker.record(layer_idx, slot - 1, 0, best_off, velocity)
-            if abs(best_off) < self.exercise.timing_ok_ms:
+            if abs(best_off) < exercise.timing_ok_ms:
                 self.rend.pad(pad_idx, Color.GREEN, BRIGHTNESS_BRIGHT)
                 grade = "GREEN"
             else:
@@ -1717,6 +1794,7 @@ class Trainer:
         self.rend.button_led_off(BTN_PLAY)
         self.rend.button_led_off(BTN_STOP)
         self.rend.button_led_off(BTN_REC)
+        self.rend.button_led_off(BTN_SHIFT)
         for btn_id, _ in BANK_BUTTONS:
             self.rend.button_led_off(btn_id)
         try:
@@ -1829,6 +1907,7 @@ def main():
     print("    REC      — demo (listen to pattern)")
     print("    PLAY     — start exercise")
     print("    STOP     — back")
+    print("    SHIFT    — toggle progress lock (unlock by completing prev)")
     print("    ENCODER  — push to adjust BPM")
     print("    Ctrl+C   — quit")
     print()
